@@ -16,7 +16,7 @@ export class CareerPilotApi {
     const base = config.apiBaseUrl.endsWith("/") ? config.apiBaseUrl : `${config.apiBaseUrl}/`;
     const url = new URL(path.slice(1), base);
     const headers = new Headers(init.headers);
-    headers.set("Accept", "application/json");
+    if (!headers.has("Accept")) headers.set("Accept", "application/json");
     if (config.apiToken) headers.set("Authorization", `Bearer ${config.apiToken}`);
     if (init.body !== undefined && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
