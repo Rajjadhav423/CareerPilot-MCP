@@ -59,6 +59,7 @@ export async function callCareerPilotTool(api: CareerPilotApi, name: string, raw
       const parsed = toolSchemas.preview_resume.parse(rawArgs);
       result = await api.request("/resumes/render/preview", {
         method: "POST",
+        headers: { Accept: "text/html" },
         body: JSON.stringify({
           ...(parsed.templateId ? { templateId: parsed.templateId } : {}),
           data: parsed.data,
@@ -73,7 +74,7 @@ export async function callCareerPilotTool(api: CareerPilotApi, name: string, raw
 
   return {
     content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-    structuredContent: result,
+    structuredContent: { data: result },
     isError: false,
   };
 }
