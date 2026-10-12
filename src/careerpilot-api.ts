@@ -33,6 +33,9 @@ export class CareerPilotApi {
       throw new CareerPilotApiError(`CareerPilot API returned HTTP ${response.status}.`, response.status);
     }
     if (!body) return undefined as T;
+    if (response.headers.get("content-type")?.includes("text/html")) {
+      return body as T;
+    }
 
     try {
       return JSON.parse(body) as T;
