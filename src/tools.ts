@@ -57,7 +57,7 @@ export async function callCareerPilotTool(api: CareerPilotApi, name: string, raw
     }
     case "preview_resume": {
       const parsed = toolSchemas.preview_resume.parse(rawArgs);
-      result = await api.request("/resumes/preview", {
+      result = await api.request("/resumes/render/preview", {
         method: "POST",
         body: JSON.stringify({
           ...(parsed.templateId ? { templateId: parsed.templateId } : {}),
