@@ -15,6 +15,16 @@ describe("backend client", () => {
     fetchMock.mockRestore();
   });
 
+  it("passes the backend's problem detail and field errors through", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(
+      '{"status":400,"detail":"Validation failed.","errors":{"data.basics.email":"must be an email address"}}',
+      { status: 400, headers: { "content-type": "application/problem+json" } },
+    ));
+    await expect(createBackendClient("http://backend.test", 1000, "token").request("/resumes/document"))
+      .rejects.toEqual(expect.objectContaining({ status: 400, message: "Validation failed.\n- data.basics.email: must be an email address" }));
+    vi.restoreAllMocks();
+  });
+
   it("sanitizes unavailable and timeout failures into typed backend errors", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("private network detail"));
     await expect(createBackendClient("http://backend.test", 1000, "token").request("/health"))

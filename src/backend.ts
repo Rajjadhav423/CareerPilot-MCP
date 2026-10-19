@@ -4,6 +4,17 @@ export class BackendError extends Error {
   }
 }
 
+/** The backend's error detail plus any field errors, so the assistant can see what to fix. */
+export function problemMessage(value: unknown, status: number): string {
+  const problem = typeof value === "object" && value !== null ? value as { detail?: unknown; errors?: unknown } : {};
+  const detail = typeof problem.detail === "string" ? problem.detail : `Backend request failed with status ${status}.`;
+  // errors: { "data.basics.email": "must be an email address", … }
+  const errors = typeof problem.errors === "object" && problem.errors !== null
+    ? Object.entries(problem.errors).slice(0, 10).map(([field, message]) => `${field}: ${String(message)}`)
+    : [];
+  return errors.length > 0 ? `${detail}\n- ${errors.join("\n- ")}` : detail;
+}
+
 export type BackendClient = {
   request<T>(path: string, init?: RequestInit): Promise<T>;
 };
@@ -25,13 +36,9 @@ export function createBackendClient(baseUrl: string, timeoutMs: number, token: s
           },
         });
         const contentType = response.headers.get("content-type") ?? "";
-        const value = contentType.includes("application/json") ? await response.json() : await response.text();
-        if (!response.ok) {
-          const detail = typeof value === "object" && value !== null && "detail" in value
-            ? String((value as { detail: unknown }).detail)
-            : `Backend request failed with status ${response.status}.`;
-          throw new BackendError(response.status, detail);
-        }
+        // Errors come as application/problem+json: { detail, errors?: [{ field, message }] }
+        const value = /[/+]json\b/.test(contentType) ? await response.json() : await response.text();
+        if (!response.ok) throw new BackendError(response.status, problemMessage(value, response.status));
         return value as T;
       } catch (error) {
         if (error instanceof BackendError) throw error;
