@@ -21,7 +21,7 @@ async function connect(routes: Record<string, (body: unknown) => unknown>) {
     },
   };
   const server = new McpServer({ name: "test", version: "0" });
-  registerTools(server, { backend, userToken: "user" });
+  registerTools(server, { backend, principal: "user_test" });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await server.connect(a);
   const client = new Client({ name: "test", version: "0" });

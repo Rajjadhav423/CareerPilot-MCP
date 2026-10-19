@@ -1,0 +1,32 @@
+# Render Blueprint: New > Blueprint, pick this repo. Secrets marked sync: false are entered in the dashboard.
+services:
+  - type: web
+    name: careerpilot-mcp
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22.18.0"
+      - key: MCP_TRANSPORT
+        value: http
+      # https://careerpilot-mcp.onrender.com, or your custom domain (no trailing slash)
+      - key: MCP_PUBLIC_URL
+        sync: false
+      # The production API, e.g. https://careerpilotbackend.vercel.app
+      - key: CAREERPILOT_BACKEND_URL
+        sync: false
+      # Same value as the API's MCP_SERVICE_SECRET
+      - key: MCP_SERVICE_SECRET
+        sync: false
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      - key: CLERK_SECRET_KEY
+        sync: false
+      # The production frontend origin, e.g. https://careerpilot.vercel.app
+      - key: MCP_CORS_ORIGINS
+        sync: false
+      - key: MCP_RATE_LIMIT_PER_MINUTE
+        value: "60"

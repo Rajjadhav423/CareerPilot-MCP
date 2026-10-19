@@ -19,7 +19,8 @@ export type BackendClient = {
   request<T>(path: string, init?: RequestInit): Promise<T>;
 };
 
-export function createBackendClient(baseUrl: string, timeoutMs: number, token: string): BackendClient {
+/** `token`: the bearer for each call; a function is called per request (e.g. a fresh short-lived service token). */
+export function createBackendClient(baseUrl: string, timeoutMs: number, token: string | (() => string)): BackendClient {
   return {
     async request<T>(path: string, init: RequestInit = {}) {
       const controller = new AbortController();
@@ -31,7 +32,7 @@ export function createBackendClient(baseUrl: string, timeoutMs: number, token: s
           headers: {
             Accept: "application/json",
             "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
+            Authorization: `Bearer ${typeof token === "function" ? token() : token}`,
             ...(init.headers ?? {}),
           },
         });
