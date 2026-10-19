@@ -39,6 +39,10 @@ export function createBackendClient(baseUrl: string, timeoutMs: number, token: s
         const contentType = response.headers.get("content-type") ?? "";
         // Errors come as application/problem+json: { detail, errors?: [{ field, message }] }
         const value = /[/+]json\b/.test(contentType) ? await response.json() : await response.text();
+        if (response.status === 401) {
+          // Shows up in the host's logs when the API refuses our token (e.g. MCP_SERVICE_SECRET differs); no token data
+          console.warn(`CareerPilot API refused the request (401) for ${init.method ?? "GET"} ${path.split("?")[0]}`);
+        }
         if (!response.ok) throw new BackendError(response.status, problemMessage(value, response.status));
         return value as T;
       } catch (error) {

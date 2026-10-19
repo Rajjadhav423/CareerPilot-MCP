@@ -78,6 +78,11 @@ describe("config", () => {
     });
   });
 
+  it("trims the service secret like the API does", () => {
+    expect(loadConfig({ ...http, MCP_SERVICE_SECRET: ` ${"s".repeat(32)}
+` }).serviceSecret).toBe("s".repeat(32));
+  });
+
   it("allows the loopback names locally", () => {
     expect(loadConfig({ ...http, PORT: "3001" }).allowedHosts).toEqual(["localhost:3001", "127.0.0.1:3001", "[::1]:3001"]);
   });

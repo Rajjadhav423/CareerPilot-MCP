@@ -7,7 +7,8 @@ const configSchema = z.object({
   /** The public address clients use, e.g. https://mcp.example.com. The OAuth resource and allowed Host come from it. */
   MCP_PUBLIC_URL: z.string().url().optional(),
   /** Shared with the API only (its MCP_SERVICE_SECRET): signs the server's own calls to the API. */
-  MCP_SERVICE_SECRET: z.string().min(32, "MCP_SERVICE_SECRET must be at least 32 characters").optional(),
+  // Trimmed like the API does, so a pasted newline or space can't make the two secrets differ
+  MCP_SERVICE_SECRET: z.string().trim().min(32, "MCP_SERVICE_SECRET must be at least 32 characters").optional(),
   CLERK_PUBLISHABLE_KEY: z.string().min(1).optional(),
   CLERK_SECRET_KEY: z.string().min(1).optional(),
   MCP_CORS_ORIGINS: z.string().default("http://localhost:3000"),
