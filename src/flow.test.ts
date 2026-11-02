@@ -182,4 +182,38 @@ describe("apply flow", () => {
     expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId, driveDocumentId })).error).toBe(true);
     expect(calls.some((call) => call.endsWith("/emails"))).toBe(false);
   });
+  const SENT = "66666666-6666-4666-8666-666666666666";
+  const OTHER_JOB = "77777777-7777-4777-8777-777777777777";
+
+  it("sends a follow-up in the thread of an email sent for this job, approved with it", async () => {
+    let sent: Record<string, unknown> = {};
+    const { tool } = await connect({
+      [`POST /jobs/${JOB}/emails/compose`]: () => composed,
+      "GET /gmail/status": () => gmailReady,
+      [`GET /jobs/${JOB}/emails`]: () => [{ id: SENT, recipient: "hr@acme.com", subject: "Application", sentAt: "2026-11-01T10:00:00Z", status: "OPENED" }],
+      [`POST /jobs/${JOB}/emails`]: (body) => { sent = body as Record<string, unknown>; return { id: "sent" }; },
+    });
+    const missing = (await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com", replyToId: DRIVE_DOC })).value;
+    expect(missing.ready).toBe(false);
+    expect(missing.blockers.join()).toMatch(/follow up/);
+
+    const prepared = (await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com", replyToId: SENT })).value;
+    expect(prepared.followUpOf).toMatchObject({ subject: "Application", status: "OPENED" });
+    const { approvalToken, to, subject, body, templateId, replyToId } = prepared;
+    // The approval covers the thread and the job: neither can change at send time
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId })).error).toBe(true);
+    expect((await tool("send_application_email", { jobId: OTHER_JOB, approvalToken, to, subject, body, templateId, replyToId })).error).toBe(true);
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId, replyToId })).error).toBe(false);
+    expect(sent).toMatchObject({ replyToId: SENT, confirmed: true });
+  });
+
+  it("searches jobs with only the filters given and marks the results untrusted", async () => {
+    const paths: string[] = [];
+    const { tool, calls } = await connect({});
+    const search = async (args: Record<string, unknown>) => { await tool("search_jobs", args); paths.push(calls.at(-1)!); };
+    await search({ q: "java dev", country: "India", remote: true, role: "BACKEND", posted: "7d" });
+    await search({});
+    expect(paths).toEqual(["GET /discover/jobs?q=java+dev&country=India&remote=true&role=BACKEND&posted=7d&limit=20", "GET /discover/jobs?limit=20"]);
+    expect((await tool("search_jobs", { role: "CHEF" })).error).toBe(true);
+  });
 });

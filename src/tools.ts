@@ -6,6 +6,8 @@ import { editableBlocks, type TextEdit } from "./document-edits.js";
 import { AI_RESUME_TITLE, saveTailoredResume, sourceResume, type Resume } from "./ai-resume.js";
 
 export const id = z.string().uuid();
+const JOB_STATUSES = ["SAVED", "TO_REVIEW", "PREPARING", "APPLIED", "INTERVIEW", "OFFER", "REJECTED", "CLOSED"] as const;
+const TECH_ROLES = ["BACKEND", "FRONTEND", "FULL_STACK", "MOBILE", "DEVOPS", "DATA_ML", "QA", "SECURITY", "GENERAL"] as const;
 export const resumeInput = z.object({
   title: z.string().trim().min(1).max(120),
   templateId: z.string().max(40).nullish(),
@@ -29,7 +31,7 @@ export const jobInput = z.object({
   jobUrl: z.string().max(2048).regex(/^https?:\/\/\S+$/).nullish(),
   description: z.string().max(20_000).nullish(),
   notes: z.string().max(10_000).nullish(),
-  status: z.enum(["SAVED", "TO_REVIEW", "PREPARING", "APPLIED", "INTERVIEW", "OFFER", "REJECTED", "CLOSED"]).nullish(),
+  status: z.enum(JOB_STATUSES).nullish(),
   source: z.string().max(32).nullish(),
   externalId: z.string().max(200).nullish(),
 });
@@ -40,6 +42,20 @@ export const emailContent = z.object({
   templateId: z.string().uuid().nullish(),
   resumeId: z.string().uuid().nullish(),
   driveDocumentId: z.string().uuid().nullish(),
+  /** A follow-up: the sent email (of this job) whose Gmail thread it goes into */
+  replyToId: z.string().uuid().nullish(),
+});
+/** Job search filters, as the backend's GET /discover/jobs takes them. */
+export const jobSearchInput = z.object({
+  q: z.string().trim().max(200).nullish(),
+  location: z.string().trim().max(100).nullish(),
+  country: z.string().trim().max(60).nullish(),
+  city: z.string().trim().max(80).nullish(),
+  remote: z.boolean().nullish(),
+  role: z.enum(TECH_ROLES).nullish(),
+  posted: z.enum(["24h", "3d", "7d", "30d"]).nullish(),
+  hasEmail: z.boolean().nullish(),
+  limit: z.number().int().min(1).max(50).nullish(),
 });
 
 type Approval = { principal: string; expiresAt: number; digest: string };
@@ -50,6 +66,7 @@ type Composed = { templateId: string | null; templateName: string | null; subjec
 type GmailStatus = { configured: boolean; connected: boolean; canSend: boolean; googleEmail: string | null };
 type DriveStatus = { configured: boolean; connected: boolean; permissionGranted: boolean; folderName: string | null };
 type DriveDocument = { id: string; name: string; webViewLink: string | null };
+type SentEmail = { id: string; recipient: string; subject: string; sentAt: string; status: string };
 
 /** The saved detail ({{resume_url}}) that templates use for the resume link. */
 const RESUME_URL_KEY = "resume_url";
@@ -80,14 +97,16 @@ export function sendBlockers(composed: Composed, gmail: GmailStatus): string[] {
   return blockers;
 }
 
-/** What an approval token is bound to: the exact email, its attachment and the tailored resume accepted with it. */
-export const approvalContent = (value: { to: string; subject: string; body: string; templateId?: string | null; resumeId?: string | null; driveDocumentId?: string | null }) => ({
+/** What an approval token is bound to: the job, the exact email, its attachment, the tailored resume accepted with it and the thread it replies in. */
+export const approvalContent = (value: { jobId: string; to: string; subject: string; body: string; templateId?: string | null; resumeId?: string | null; driveDocumentId?: string | null; replyToId?: string | null }) => ({
+  jobId: value.jobId,
   to: value.to.trim(),
   subject: value.subject,
   body: value.body,
   templateId: value.templateId ?? null,
   resumeId: value.resumeId ?? null,
   driveDocumentId: value.driveDocumentId ?? null,
+  replyToId: value.replyToId ?? null,
 });
 
 /** principal: who is calling (the verified Clerk user id); approvals are bound to it. */
@@ -167,50 +186,55 @@ export function registerTools(server: McpServer, context: ToolContext) {
     }));
   server.registerTool("save_job", { description: "Save a job for the authenticated user; the backend deduplicates supported external ids.", inputSchema: jobInput.shape },
     async (input: z.infer<typeof jobInput>) => call(() => context.backend.request("/jobs", { method: "POST", body: JSON.stringify(input) })));
-  server.registerTool("list_my_jobs", { description: "List the authenticated user's jobs.", inputSchema: { archived: z.boolean().optional(), status: z.string().optional() } },
+  server.registerTool("list_my_jobs", { description: "List the authenticated user's jobs.", inputSchema: { archived: z.boolean().optional(), status: z.enum(JOB_STATUSES).optional() } },
     async ({ archived, status }: { archived?: boolean; status?: string }) => call(() => context.backend.request(`/jobs?archived=${archived === true ? "true" : "false"}${status ? `&status=${encodeURIComponent(status)}` : ""}`)));
   server.registerTool("get_job_details", { description: "Retrieve an owned job by id.", inputSchema: { jobId: id } },
     async ({ jobId }: { jobId: string }) => call(async () => ({ ...(await context.backend.request<Record<string, unknown>>(`/jobs/${jobId}`)), untrusted: UNTRUSTED_JOB_TEXT })));
   server.registerTool("update_job_details", { description: "Correct an owned job's title, company or location (e.g. a scraped title that holds the whole post). Only the fields given change.", inputSchema: { jobId: id, title: z.string().trim().min(1).max(200).regex(/^[^\r\n]*$/, "must be a single line").nullish(), company: z.string().trim().min(1).max(200).nullish(), location: z.string().trim().max(200).nullish() } },
     async ({ jobId, ...fields }: { jobId: string; title?: string | null; company?: string | null; location?: string | null }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(fields) })));
-  server.registerTool("update_job_status", { description: "Update the status of an owned job.", inputSchema: { jobId: id, status: z.enum(["SAVED", "TO_REVIEW", "PREPARING", "APPLIED", "INTERVIEW", "OFFER", "REJECTED", "CLOSED"]) } },
+  server.registerTool("update_job_status", { description: "Update the status of an owned job.", inputSchema: { jobId: id, status: z.enum(JOB_STATUSES) } },
     async ({ jobId, status }: { jobId: string; status: string }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify({ status }) })));
-  server.registerTool("prepare_application_email", { description: "Compose an application email from the user's template for review; sends nothing. Pass driveDocumentId (from save_tailored_resume): that Drive PDF is attached and its link replaces the saved resume link in the body. Show the user the recipient, subject, body, attachment and resume changes, and only call send_application_email after they explicitly say to send.", inputSchema: { jobId: id, to: z.string().email().max(254), templateId: z.string().uuid().nullish(), timeZone: z.string().max(64).nullish(), driveDocumentId: z.string().uuid().nullish() }, annotations: { readOnlyHint: true } },
-    async ({ jobId, to, templateId, timeZone, driveDocumentId }: { jobId: string; to: string; templateId?: string | null; timeZone?: string | null; driveDocumentId?: string | null }) => call(async () => {
-      const [composed, gmail, documents, fields] = await Promise.all([
+  server.registerTool("prepare_application_email", { description: "Compose an application email from the user's template for review; sends nothing. Pass driveDocumentId (from save_tailored_resume): that Drive PDF is attached and its link replaces the saved resume link in the body. For a follow-up, pass replyToId (an email id from get_application_email_status for this job): it goes into that email's Gmail thread. Show the user the recipient, subject, body, attachment, resume changes and the email it follows up, and only call send_application_email after they explicitly say to send.", inputSchema: { jobId: id, to: z.string().email().max(254), templateId: z.string().uuid().nullish(), timeZone: z.string().max(64).nullish(), driveDocumentId: z.string().uuid().nullish(), replyToId: z.string().uuid().nullish() }, annotations: { readOnlyHint: true } },
+    async ({ jobId, to, templateId, timeZone, driveDocumentId, replyToId }: { jobId: string; to: string; templateId?: string | null; timeZone?: string | null; driveDocumentId?: string | null; replyToId?: string | null }) => call(async () => {
+      const [composed, gmail, documents, fields, history] = await Promise.all([
         context.backend.request<Composed>(`/jobs/${jobId}/emails/compose`, { method: "POST", body: JSON.stringify({ templateId, timeZone }) }),
         context.backend.request<GmailStatus>("/gmail/status"),
         driveDocumentId ? context.backend.request<DriveDocument[]>("/drive/documents") : Promise.resolve([]),
         driveDocumentId ? context.backend.request<{ key: string; value: string }[]>("/me/fields") : Promise.resolve([]),
+        replyToId ? context.backend.request<SentEmail[]>(`/jobs/${jobId}/emails`) : Promise.resolve([]),
       ]);
       const blockers = sendBlockers(composed, gmail);
       const file = driveDocumentId ? documents.find((document) => document.id === driveDocumentId) : undefined;
       if (driveDocumentId && !file) blockers.push("The tailored resume isn't in Google Drive anymore: run save_tailored_resume again.");
+      const original = replyToId ? history.find((email) => email.id === replyToId) : undefined;
+      if (replyToId && !original) blockers.push("The email to follow up on isn't one sent for this job: pick one from get_application_email_status.");
       if (blockers.length > 0) return { ready: false, blockers, draft: composed, note: "Nothing can be sent yet. Tell the user what to fix in CareerPilot." };
       // The saved resume link points at an older file: this application's Drive PDF goes there instead
       const savedLink = fields.find((field) => field.key === RESUME_URL_KEY)?.value?.trim();
       const body = file?.webViewLink && savedLink ? composed.body.split(savedLink).join(file.webViewLink) : composed.body;
       const approvalToken = randomUUID();
-      const content = approvalContent({ to, subject: composed.subject, body, templateId: composed.templateId ?? templateId, driveDocumentId: file?.id ?? null });
+      const content = approvalContent({ jobId, to, subject: composed.subject, body, templateId: composed.templateId ?? templateId, driveDocumentId: file?.id ?? null, replyToId: original?.id ?? null });
       pruneApprovals();
       approvals.set(approvalToken, { principal: context.principal, expiresAt: Date.now() + 15 * 60_000, digest: approvalDigest(content) });
       return {
         ready: true, from: gmail.googleEmail, templateName: composed.templateName, ...content, approvalToken,
         attachment: file ? { name: file.name, link: file.webViewLink } : "none",
+        followUpOf: original ? { recipient: original.recipient, subject: original.subject, sentAt: original.sentAt, status: original.status } : "none",
         approvalBinding: "Send exactly these values. Any change needs a new prepare_application_email.",
       };
     }));
   server.registerTool("send_application_email", { description: "Send a prepared application email from the user's Gmail, with its Drive resume attached. Only after the user explicitly approved the exact email shown by prepare_application_email.", inputSchema: { jobId: id, approvalToken: z.string().uuid(), ...emailContent.shape }, annotations: { destructiveHint: true } },
     async ({ jobId, approvalToken, ...input }: { jobId: string; approvalToken: string } & z.infer<typeof emailContent>) => call(async () => {
       const approval = approvals.get(approvalToken);
-      const digest = approvalDigest(approvalContent(input));
+      const digest = approvalDigest(approvalContent({ jobId, ...input }));
       if (!approval || approval.principal !== context.principal || approval.expiresAt < Date.now() || approval.digest !== digest) {
         throw new Error("Approval is missing, expired, or does not match the exact message.");
       }
       const gmail = await context.backend.request<GmailStatus>("/gmail/status");
       if (!gmail.canSend) throw new Error("Gmail can't send yet: connect Gmail in CareerPilot and allow sending. Nothing was sent.");
       approvals.delete(approvalToken);
-      // driveDocumentId: the backend downloads that Drive PDF and attaches it, so the link and the attachment match
+      // driveDocumentId: the backend downloads that Drive PDF and attaches it, so the link and the attachment match;
+      // replyToId: the backend sends it in that email's Gmail thread
       return context.backend.request(`/jobs/${jobId}/emails`, { method: "POST", body: JSON.stringify({ ...input, confirmed: true }) });
     }));
   server.registerTool("import_job_from_link", { description: "Read a job posting from a link (LinkedIn post, job board, careers page) and save it to the user's jobs. Returns the saved job and the HR email found in the post. To apply: tailor_resume_for_job (from the user's own resume) → save_tailored_resume → prepare_application_email (to = hrEmail, driveDocumentId from save_tailored_resume) → show the user → send_application_email after they confirm.", inputSchema: { url: z.string().max(2048).regex(/^https?:\/\/\S+$/) } },
@@ -238,6 +262,28 @@ export function registerTools(server: McpServer, context: ToolContext) {
       "4. Show me one summary: recipient, subject, body, attached resume, and the resume changes from save_tailored_resume. Stop if it is not ready.",
       "5. Only after I reply 'send', call send_application_email with exactly the prepared values.",
     ].join("\n") } }] }));
-  server.registerTool("get_application_email_status", { description: "List email records for an owned job. Results reflect backend acceptance, not delivery or read status.", inputSchema: { jobId: id } },
+  server.registerTool("get_application_email_status", { description: "Tracking for the emails sent about an owned job: status (REPLIED, BOUNCED, OPENED, DELIVERED or SENT), when it was opened and replied to. DELIVERED means no bounce came back; opens are approximate (images can be blocked or prefetched) and openTracked=false means opens weren't tracked; checkedAt=null means bounces and replies can't be checked until the user allows reply tracking in CareerPilot.", inputSchema: { jobId: id }, annotations: { readOnlyHint: true } },
     async ({ jobId }: { jobId: string }) => call(() => context.backend.request(`/jobs/${jobId}/emails`)));
+  server.registerTool("list_sent_application_emails", { description: "Every application email the user sent (newest 100), with the job and its tracking status (REPLIED, BOUNCED, OPENED, DELIVERED or SENT). Use it to answer which applications got replies, bounced or were opened.", inputSchema: {}, annotations: { readOnlyHint: true } },
+    async () => call(() => context.backend.request("/emails")));
+  server.registerTool("search_jobs", { description: "Search public job postings (job boards and company career pages). Saves nothing: save one with save_job (source and externalId from the result), then apply as usual.", inputSchema: jobSearchInput.shape, annotations: { readOnlyHint: true } },
+    async (input: z.infer<typeof jobSearchInput>) => call(async () => {
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries({ ...input, limit: input.limit ?? 20 })) {
+        if (value !== null && value !== undefined && value !== "") params.set(key, String(value));
+      }
+      return { ...(await context.backend.request<Record<string, unknown>>(`/discover/jobs?${params}`)), untrusted: UNTRUSTED_JOB_TEXT };
+    }));
+  server.registerTool("list_email_templates", { description: "List the user's email templates (use an id as templateId in prepare_application_email).", annotations: { readOnlyHint: true } },
+    async () => call(() => context.backend.request("/email-templates")));
+  server.registerTool("get_email_template", { description: "Retrieve an owned email template by id.", inputSchema: { templateId: id }, annotations: { readOnlyHint: true } },
+    async ({ templateId }: { templateId: string }) => call(() => context.backend.request(`/email-templates/${templateId}`)));
+  server.registerTool("list_template_merge_fields", { description: "List the placeholders ({{...}}) email templates may use.", annotations: { readOnlyHint: true } },
+    async () => call(() => context.backend.request("/email-templates/merge-fields")));
+  server.registerTool("preview_email_template", { description: "Fill a template's placeholders with the user's saved details and sample job data. Saves nothing.", inputSchema: { subject: z.string().max(255).nullish(), body: z.string().max(20_000).nullish() }, annotations: { readOnlyHint: true } },
+    async (input: { subject?: string | null; body?: string | null }) => call(() => context.backend.request("/email-templates/preview", { method: "POST", body: JSON.stringify(input) })));
+  server.registerTool("get_my_details", { description: "List the user's saved details (name, phone, links, resume_url...) that fill template placeholders. Read-only: the user edits them in CareerPilot Settings.", annotations: { readOnlyHint: true } },
+    async () => call(() => context.backend.request("/me/fields")));
+  server.registerTool("list_drive_documents", { description: "List the resume PDFs CareerPilot saved to the user's Google Drive (id = driveDocumentId).", annotations: { readOnlyHint: true } },
+    async () => call(() => context.backend.request("/drive/documents")));
 }
