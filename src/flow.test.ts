@@ -247,6 +247,43 @@ describe("apply flow", () => {
     expect(calls.some((call) => call.endsWith("/schedule"))).toBe(false);
   });
 
+  it("prepares the user's own subject and body, and sends only that approved text", async () => {
+    let composeRequest: Record<string, unknown> = {};
+    let sent: Record<string, unknown> = {};
+    const { tool } = await connect({
+      [`POST /jobs/${JOB}/emails/compose`]: (body) => {
+        composeRequest = body as Record<string, unknown>;
+        const request = body as { subject?: string; body?: string };
+        return { ...composed, subject: request.subject ?? composed.subject, body: request.body ?? composed.body };
+      },
+      "GET /gmail/status": () => gmailReady,
+      [`POST /jobs/${JOB}/emails`]: (body) => { sent = body as Record<string, unknown>; return { id: "sent" }; },
+    });
+    const ownSubject = "Application for Java Developer – Rajesh Jadhav";
+    const ownBody = "Dear team,\n\nBest regards,\nRajesh Jadhav";
+    const prepared = (await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com", subject: ownSubject, body: ownBody })).value;
+    expect(composeRequest).toMatchObject({ subject: ownSubject, body: ownBody });
+    expect(prepared).toMatchObject({ ready: true, subject: ownSubject, body: ownBody });
+    // Two-line subjects are refused before anything is composed
+    expect((await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com", subject: "a\nb" })).error).toBe(true);
+    const { approvalToken, to, subject, body, templateId } = prepared;
+    // The old template text isn't what was approved
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject: composed.subject, body, templateId })).error).toBe(true);
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId })).error).toBe(false);
+    expect(sent).toMatchObject({ subject: ownSubject, body: ownBody, confirmed: true });
+  });
+
+  it("returns the user's account and saved details with their placeholders", async () => {
+    const { tool } = await connect({
+      "GET /me": () => ({ id: "u1", email: "me@gmail.com", displayName: "Rajesh Jadhav", avatarUrl: null }),
+      "GET /me/fields": () => [{ key: "github", label: "GitHub", value: "https://github.com/me" }],
+    });
+    expect((await tool("get_my_details", {})).value).toEqual({
+      account: { name: "Rajesh Jadhav", email: "me@gmail.com" },
+      details: [{ key: "github", label: "GitHub", value: "https://github.com/me", placeholder: "{{github}}" }],
+    });
+  });
+
   it("searches jobs with only the filters given and marks the results untrusted", async () => {
     const paths: string[] = [];
     const { tool, calls } = await connect({});

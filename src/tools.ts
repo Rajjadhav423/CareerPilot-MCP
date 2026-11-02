@@ -196,10 +196,10 @@ export function registerTools(server: McpServer, context: ToolContext) {
     async ({ jobId, ...fields }: { jobId: string; title?: string | null; company?: string | null; location?: string | null }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(fields) })));
   server.registerTool("update_job_status", { description: "Update the status of an owned job.", inputSchema: { jobId: id, status: z.enum(JOB_STATUSES) } },
     async ({ jobId, status }: { jobId: string; status: string }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify({ status }) })));
-  server.registerTool("prepare_application_email", { description: "Compose an application email from the user's template for review; sends nothing. Pass driveDocumentId (from save_tailored_resume): that Drive PDF is attached and its link replaces the saved resume link in the body. For a follow-up, pass replyToId (an email id from get_application_email_status for this job): it goes into that email's Gmail thread. Show the user the recipient, subject, body, attachment, resume changes and the email it follows up, and only call send_application_email after they explicitly say to send (or schedule_application_email, with the time they chose, if they want it sent later).", inputSchema: { jobId: id, to: z.string().email().max(254), templateId: z.string().uuid().nullish(), timeZone: z.string().max(64).nullish(), driveDocumentId: z.string().uuid().nullish(), replyToId: z.string().uuid().nullish() }, annotations: { readOnlyHint: true } },
-    async ({ jobId, to, templateId, timeZone, driveDocumentId, replyToId }: { jobId: string; to: string; templateId?: string | null; timeZone?: string | null; driveDocumentId?: string | null; replyToId?: string | null }) => call(async () => {
+  server.registerTool("prepare_application_email", { description: "Compose an application email from the user's template for review; sends nothing. To change the wording (a different subject, the user's own body or signature, edits they ask for), pass subject and/or body: they replace the template's, and {{placeholders}} in them (e.g. {{job_title}}, {{company_name}}, {{resume_url}}) are filled the same way. Every change needs a new prepare_application_email call, which returns a new approvalToken for the exact final text. Pass driveDocumentId (from save_tailored_resume): that Drive PDF is attached and its link replaces the saved resume link in the body. For a follow-up, pass replyToId (an email id from get_application_email_status for this job): it goes into that email's Gmail thread. Show the user the recipient, subject, body, attachment, resume changes and the email it follows up, and only call send_application_email after they explicitly say to send (or schedule_application_email, with the time they chose, if they want it sent later).", inputSchema: { jobId: id, to: z.string().email().max(254), templateId: z.string().uuid().nullish(), timeZone: z.string().max(64).nullish(), driveDocumentId: z.string().uuid().nullish(), replyToId: z.string().uuid().nullish(), subject: z.string().trim().max(255).refine((value) => !/[\r\n]/.test(value), "must be a single line").nullish(), body: z.string().max(20_000).nullish() }, annotations: { readOnlyHint: true } },
+    async ({ jobId, to, templateId, timeZone, driveDocumentId, replyToId, subject, body: ownBody }: { jobId: string; to: string; templateId?: string | null; timeZone?: string | null; driveDocumentId?: string | null; replyToId?: string | null; subject?: string | null; body?: string | null }) => call(async () => {
       const [composed, gmail, documents, fields, history] = await Promise.all([
-        context.backend.request<Composed>(`/jobs/${jobId}/emails/compose`, { method: "POST", body: JSON.stringify({ templateId, timeZone }) }),
+        context.backend.request<Composed>(`/jobs/${jobId}/emails/compose`, { method: "POST", body: JSON.stringify({ templateId, timeZone, subject, body: ownBody }) }),
         context.backend.request<GmailStatus>("/gmail/status"),
         driveDocumentId ? context.backend.request<DriveDocument[]>("/drive/documents") : Promise.resolve([]),
         driveDocumentId ? context.backend.request<{ key: string; value: string }[]>("/me/fields") : Promise.resolve([]),
@@ -283,7 +283,7 @@ export function registerTools(server: McpServer, context: ToolContext) {
       "1. import_job_from_link with the url.",
       `2. list_my_resumes and pick the most relevant of my own resumes (not "${AI_RESUME_TITLE}"; ask if unsure); tailor_resume_for_job with the new jobId; write the tailoring following its rules; save_tailored_resume with the jobId.`,
       "3. prepare_application_email with to = hrEmail (ask me if none) and driveDocumentId from save_tailored_resume.",
-      "4. Show me one summary: recipient, subject, body, attached resume, and the resume changes from save_tailored_resume. Stop if it is not ready.",
+      "4. Show me one summary: recipient, subject, body, attached resume, and the resume changes from save_tailored_resume. Stop if it is not ready. For any fact about me the email needs (signature, phone, links), use get_my_details; ask me for anything that isn't there.",
       "5. Only after I reply 'send', call send_application_email with exactly the prepared values. If I reply 'schedule' with a time (e.g. 'schedule tomorrow 9am'), confirm the exact date, time and my time zone back to me, then call schedule_application_email with exactly the prepared values and sendAt as ISO 8601 with my time zone offset.",
     ].join("\n") } }] }));
   server.registerPrompt("manage_scheduled_emails", { description: "See your scheduled application emails and change, send or cancel them.", argsSchema: {} },
@@ -315,8 +315,17 @@ export function registerTools(server: McpServer, context: ToolContext) {
     async () => call(() => context.backend.request("/email-templates/merge-fields")));
   server.registerTool("preview_email_template", { description: "Fill a template's placeholders with the user's saved details and sample job data. Saves nothing.", inputSchema: { subject: z.string().max(255).nullish(), body: z.string().max(20_000).nullish() }, annotations: { readOnlyHint: true } },
     async (input: { subject?: string | null; body?: string | null }) => call(() => context.backend.request("/email-templates/preview", { method: "POST", body: JSON.stringify(input) })));
-  server.registerTool("get_my_details", { description: "List the user's saved details (name, phone, links, resume_url...) that fill template placeholders. Read-only: the user edits them in CareerPilot Settings.", annotations: { readOnlyHint: true } },
-    async () => call(() => context.backend.request("/me/fields")));
+  server.registerTool("get_my_details", { description: "The user's own facts, as saved in CareerPilot: account name and email, plus their saved details from Settings (e.g. phone, email, LinkedIn, GitHub, portfolio, resume_url) with the {{placeholder}} each fills. Use this whenever you need a fact about the user that isn't in the conversation or their resume, e.g. for an email signature, a cover letter or a form, and use the values exactly as saved (no tracking parameters added to links). Never invent a detail that isn't here: ask the user instead. Read-only: the user edits these in CareerPilot Settings.", annotations: { readOnlyHint: true } },
+    async () => call(async () => {
+      const [account, details] = await Promise.all([
+        context.backend.request<{ email: string | null; displayName: string | null }>("/me"),
+        context.backend.request<{ key: string; label: string; value: string }[]>("/me/fields"),
+      ]);
+      return {
+        account: { name: account.displayName, email: account.email },
+        details: details.map((detail) => ({ ...detail, placeholder: `{{${detail.key}}}` })),
+      };
+    }));
   server.registerTool("list_drive_documents", { description: "List the resume PDFs CareerPilot saved to the user's Google Drive (id = driveDocumentId).", annotations: { readOnlyHint: true } },
     async () => call(() => context.backend.request("/drive/documents")));
 }
