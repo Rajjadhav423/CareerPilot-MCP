@@ -60,8 +60,21 @@ export const jobSearchInput = z.object({
   limit: z.number().int().min(1).max(50).nullish(),
 });
 
-type Approval = { principal: string; expiresAt: number; digest: string };
+/**
+ * A prepared email the user can approve. content is the exact final email: send and schedule use it as stored, so
+ * nothing the assistant re-types (markdown escapes, spacing, an older draft) can change what goes out.
+ */
+type Approval = { principal: string; expiresAt: number; digest: string; content: ReturnType<typeof approvalContent> };
 const approvals = new Map<string, Approval>();
+
+/** The prepared email this token approves, for this user and job; throws when it's missing, expired or for another job. */
+function approvedEmail(token: string, jobId: string, principal: string): Approval {
+  const approval = approvals.get(token);
+  if (!approval || approval.principal !== principal || approval.expiresAt < Date.now() || approval.content.jobId !== jobId) {
+    throw new Error("Approval is missing, expired, or for a different job. Call prepare_application_email again and show the user the email.");
+  }
+  return approval;
+}
 const approvalDigest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const text = (value: unknown) => JSON.stringify(value, null, 2);
 type Composed = { templateId: string | null; templateName: string | null; subject: string; body: string; missingFields: { placeholder: string; label: string }[]; unknownPlaceholders: string[] };
@@ -217,41 +230,35 @@ export function registerTools(server: McpServer, context: ToolContext) {
       const approvalToken = randomUUID();
       const content = approvalContent({ jobId, to, subject: composed.subject, body, templateId: composed.templateId ?? templateId, driveDocumentId: file?.id ?? null, replyToId: original?.id ?? null });
       pruneApprovals();
-      approvals.set(approvalToken, { principal: context.principal, expiresAt: Date.now() + 15 * 60_000, digest: approvalDigest(content) });
+      approvals.set(approvalToken, { principal: context.principal, expiresAt: Date.now() + 15 * 60_000, digest: approvalDigest(content), content });
       return {
         ready: true, from: gmail.googleEmail, templateName: composed.templateName, ...content, approvalToken,
         attachment: file ? { name: file.name, link: file.webViewLink } : "none",
         followUpOf: original ? { recipient: original.recipient, subject: original.subject, sentAt: original.sentAt, status: original.status } : "none",
-        approvalBinding: "Send exactly these values. Any change needs a new prepare_application_email.",
+        approvalBinding: "To send (or schedule) exactly this email, pass only jobId and approvalToken: the server sends this stored text. Any change needs a new prepare_application_email with the new subject/body.",
       };
     }));
-  server.registerTool("send_application_email", { description: "Send a prepared application email from the user's Gmail, with its Drive resume attached. Only after the user explicitly approved the exact email shown by prepare_application_email.", inputSchema: { jobId: id, approvalToken: z.string().uuid(), ...emailContent.shape }, annotations: { destructiveHint: true } },
-    async ({ jobId, approvalToken, ...input }: { jobId: string; approvalToken: string } & z.infer<typeof emailContent>) => call(async () => {
-      const approval = approvals.get(approvalToken);
-      const digest = approvalDigest(approvalContent({ jobId, ...input }));
-      if (!approval || approval.principal !== context.principal || approval.expiresAt < Date.now() || approval.digest !== digest) {
-        throw new Error("Approval is missing, expired, or does not match the exact message.");
-      }
+  server.registerTool("send_application_email", { description: "Send a prepared application email from the user's Gmail, with its Drive resume attached. Only after the user explicitly approved the exact email shown by prepare_application_email. Pass just jobId and approvalToken: the server sends the exact prepared text it stored (recipient, subject, body, attachment, thread); any text you pass is ignored. To change the email, call prepare_application_email again.", inputSchema: { jobId: id, approvalToken: z.string().uuid(), ...emailContent.partial().shape }, annotations: { destructiveHint: true } },
+    async ({ jobId, approvalToken }: { jobId: string; approvalToken: string }) => call(async () => {
+      const approval = approvedEmail(approvalToken, jobId, context.principal);
       const gmail = await context.backend.request<GmailStatus>("/gmail/status");
       if (!gmail.canSend) throw new Error("Gmail can't send yet: connect Gmail in CareerPilot and allow sending. Nothing was sent.");
       approvals.delete(approvalToken);
       // driveDocumentId: the backend downloads that Drive PDF and attaches it, so the link and the attachment match;
       // replyToId: the backend sends it in that email's Gmail thread
-      return context.backend.request(`/jobs/${jobId}/emails`, { method: "POST", body: JSON.stringify({ ...input, confirmed: true }) });
+      const { jobId: _job, ...email } = approval.content;
+      return context.backend.request(`/jobs/${jobId}/emails`, { method: "POST", body: JSON.stringify({ ...email, confirmed: true }) });
     }));
-  server.registerTool("schedule_application_email", { description: "Schedule a prepared application email instead of sending it now: it is saved as a draft in the user's Gmail Drafts (Gmail's API can't use Gmail's own Scheduled folder) and CareerPilot sends that draft at sendAt, within a few minutes. Only after the user explicitly approved the exact email shown by prepare_application_email AND the send time. sendAt is ISO 8601 with the user's time zone offset (e.g. 2026-11-03T09:00:00+05:30), at least a minute ahead and within a year. Edits the user makes to the draft in Gmail are what gets sent. Change or cancel it with reschedule_scheduled_email / cancel_scheduled_email.", inputSchema: { jobId: id, approvalToken: z.string().uuid(), sendAt: z.string().datetime({ offset: true }), ...emailContent.shape }, annotations: { destructiveHint: true } },
-    async ({ jobId, approvalToken, sendAt, ...input }: { jobId: string; approvalToken: string; sendAt: string } & z.infer<typeof emailContent>) => call(async () => {
-      const approval = approvals.get(approvalToken);
-      const digest = approvalDigest(approvalContent({ jobId, ...input }));
-      if (!approval || approval.principal !== context.principal || approval.expiresAt < Date.now() || approval.digest !== digest) {
-        throw new Error("Approval is missing, expired, or does not match the exact message.");
-      }
+  server.registerTool("schedule_application_email", { description: "Schedule a prepared application email instead of sending it now: it is saved as a draft in the user's Gmail Drafts (Gmail's API can't use Gmail's own Scheduled folder) and CareerPilot sends that draft at sendAt, within a few minutes. Only after the user explicitly approved the exact email shown by prepare_application_email AND the send time. Pass jobId, approvalToken and sendAt: the stored prepared text is what gets scheduled. sendAt is ISO 8601 with the user's time zone offset (e.g. 2026-11-03T09:00:00+05:30), at least a minute ahead and within a year. Edits the user makes to the draft in Gmail are what gets sent. Change or cancel it with reschedule_scheduled_email / cancel_scheduled_email.", inputSchema: { jobId: id, approvalToken: z.string().uuid(), sendAt: z.string().datetime({ offset: true }), ...emailContent.partial().shape }, annotations: { destructiveHint: true } },
+    async ({ jobId, approvalToken, sendAt }: { jobId: string; approvalToken: string; sendAt: string }) => call(async () => {
+      const approval = approvedEmail(approvalToken, jobId, context.principal);
       const gmail = await context.backend.request<GmailStatus>("/gmail/status");
       if (!gmail.canSchedule) {
         throw new Error("Scheduling isn't allowed yet: the user must open the email dialog in CareerPilot, choose Schedule and press Allow scheduling (Google asks once for permission to create drafts). Nothing was scheduled.");
       }
       approvals.delete(approvalToken);
-      return context.backend.request(`/jobs/${jobId}/emails/schedule`, { method: "POST", body: JSON.stringify({ ...input, sendAt, confirmed: true }) });
+      const { jobId: _job, ...email } = approval.content;
+      return context.backend.request(`/jobs/${jobId}/emails/schedule`, { method: "POST", body: JSON.stringify({ ...email, sendAt, confirmed: true }) });
     }));
   server.registerTool("list_scheduled_emails", { description: "The user's scheduled application emails: SCHEDULED (waiting as a Gmail draft), SENDING, FAILED (with the reason in error), then recently SENT or CANCELLED. Times are UTC ISO 8601; show them in the user's time zone.", inputSchema: {}, annotations: { readOnlyHint: true } },
     async () => call(() => context.backend.request("/scheduled-emails")));

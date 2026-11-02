@@ -150,8 +150,10 @@ describe("apply flow", () => {
     expect(body).toBe(`Hello. My resume: ${NEW_LINK}`);
     expect(prepared.attachment).toEqual({ name: "Resume - Mecntech.pdf", link: NEW_LINK });
 
-    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body: "Changed", templateId, driveDocumentId })).error).toBe(true);
-    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId, driveDocumentId })).error).toBe(false);
+    // Only the token is needed; text the assistant passes is ignored, the stored approved text is sent
+    void to; void subject; void templateId; void driveDocumentId;
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken, body: "Changed" })).error).toBe(false);
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken })).error).toBe(true); // used up
     expect(sent).toMatchObject({ to: "2021BIT057@sggs.ac.in", body: `Hello. My resume: ${NEW_LINK}`, driveDocumentId: DRIVE_DOC, confirmed: true });
     expect(calls.some((call) => call.includes("/render/drive") || call.startsWith("PUT "))).toBe(false);
   });
@@ -200,10 +202,10 @@ describe("apply flow", () => {
     const prepared = (await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com", replyToId: SENT })).value;
     expect(prepared.followUpOf).toMatchObject({ subject: "Application", status: "OPENED" });
     const { approvalToken, to, subject, body, templateId, replyToId } = prepared;
-    // The approval covers the thread and the job: neither can change at send time
-    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId })).error).toBe(true);
-    expect((await tool("send_application_email", { jobId: OTHER_JOB, approvalToken, to, subject, body, templateId, replyToId })).error).toBe(true);
-    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId, replyToId })).error).toBe(false);
+    // The approval covers the thread and the job: the job can't change, and the stored thread is used
+    void to; void subject; void body; void templateId; void replyToId;
+    expect((await tool("send_application_email", { jobId: OTHER_JOB, approvalToken })).error).toBe(true);
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken })).error).toBe(false);
     expect(sent).toMatchObject({ replyToId: SENT, confirmed: true });
   });
 
@@ -221,12 +223,12 @@ describe("apply flow", () => {
     const prepared = (await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com" })).value;
     const { approvalToken, to, subject, body, templateId } = prepared;
     const sendAt = "2026-11-03T09:00:00+05:30";
-    // A changed body isn't the approved email
-    expect((await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt, to, subject, body: "Changed", templateId })).error).toBe(true);
-    expect((await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt: "tomorrow 9am", to, subject, body, templateId })).error).toBe(true);
-    const result = await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt, to, subject, body, templateId });
+    void to; void subject; void templateId;
+    expect((await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt: "tomorrow 9am" })).error).toBe(true);
+    // A changed body from the assistant is ignored: the stored approved text is scheduled
+    const result = await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt, body: "Changed" });
     expect(result.error).toBe(false);
-    expect(scheduled).toMatchObject({ to: "hr@acme.com", sendAt, confirmed: true });
+    expect(scheduled).toMatchObject({ to: "hr@acme.com", body, sendAt, confirmed: true });
     // The approval is used up
     expect((await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt, to, subject, body, templateId })).error).toBe(true);
     expect((await tool("list_scheduled_emails", {})).value).toEqual([{ id: SCHEDULED, status: "SCHEDULED" }]);
@@ -267,9 +269,9 @@ describe("apply flow", () => {
     // Two-line subjects are refused before anything is composed
     expect((await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com", subject: "a\nb" })).error).toBe(true);
     const { approvalToken, to, subject, body, templateId } = prepared;
-    // The old template text isn't what was approved
-    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject: composed.subject, body, templateId })).error).toBe(true);
-    expect((await tool("send_application_email", { jobId: JOB, approvalToken, to, subject, body, templateId })).error).toBe(false);
+    // Even if the assistant passes the old template subject, the approved own subject and body are sent
+    void to; void subject; void body; void templateId;
+    expect((await tool("send_application_email", { jobId: JOB, approvalToken, subject: composed.subject })).error).toBe(false);
     expect(sent).toMatchObject({ subject: ownSubject, body: ownBody, confirmed: true });
   });
 
