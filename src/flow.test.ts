@@ -216,4 +216,17 @@ describe("apply flow", () => {
     expect(paths).toEqual(["GET /discover/jobs?q=java+dev&country=India&remote=true&role=BACKEND&posted=7d&limit=20", "GET /discover/jobs?limit=20"]);
     expect((await tool("search_jobs", { role: "CHEF" })).error).toBe(true);
   });
+
+  it("matches search results against a resume and lists follow-ups", async () => {
+    const followUps = [{ kind: "DUE", job: { id: JOB, title: "Engineer", company: "Acme" }, days: 9, followUpNumber: 1,
+      lastEmail: { id: "s1", recipient: "hr@acme.com" } }];
+    const { tool, calls } = await connect({
+      [`GET /discover/jobs?hasEmail=true&resumeId=${RESUME}&limit=20`]: () => ({ jobs: [], resumeSkills: ["Java"] }),
+      "GET /follow-ups": () => followUps,
+    });
+    expect((await tool("search_jobs", { hasEmail: true, resumeId: RESUME })).value).toMatchObject({ resumeSkills: ["Java"] });
+    expect((await tool("search_jobs", { resumeId: "not-an-id" })).error).toBe(true);
+    expect((await tool("list_follow_ups_due", {})).value).toEqual(followUps);
+    expect(calls).toEqual([`GET /discover/jobs?hasEmail=true&resumeId=${RESUME}&limit=20`, "GET /follow-ups"]);
+  });
 });

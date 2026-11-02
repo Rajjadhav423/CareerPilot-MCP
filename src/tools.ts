@@ -55,6 +55,8 @@ export const jobSearchInput = z.object({
   role: z.enum(TECH_ROLES).nullish(),
   posted: z.enum(["24h", "3d", "7d", "30d"]).nullish(),
   hasEmail: z.boolean().nullish(),
+  /** One of the user's resumes: results are sorted by how well its skills cover each job's */
+  resumeId: z.string().uuid().nullish(),
   limit: z.number().int().min(1).max(50).nullish(),
 });
 
@@ -266,7 +268,7 @@ export function registerTools(server: McpServer, context: ToolContext) {
     async ({ jobId }: { jobId: string }) => call(() => context.backend.request(`/jobs/${jobId}/emails`)));
   server.registerTool("list_sent_application_emails", { description: "Every application email the user sent (newest 100), with the job and its tracking status (REPLIED, BOUNCED, OPENED, DELIVERED or SENT). Use it to answer which applications got replies, bounced or were opened.", inputSchema: {}, annotations: { readOnlyHint: true } },
     async () => call(() => context.backend.request("/emails")));
-  server.registerTool("search_jobs", { description: "Search public job postings (job boards and company career pages). Saves nothing: save one with save_job (source and externalId from the result), then apply as usual.", inputSchema: jobSearchInput.shape, annotations: { readOnlyHint: true } },
+  server.registerTool("search_jobs", { description: "Search public job postings (job boards and company career pages). hasEmail=true keeps only posts that give an HR email (contactEmail). With resumeId (from list_my_resumes), results are sorted best match first and each job has match: {score 0-100, matched skills, missing skills} (null when the post names no known skill), plus resumeSkills found in that resume; the score is keyword-based, so treat it as a guide. Saves nothing: save one with save_job (source and externalId from the result), then apply as usual.", inputSchema: jobSearchInput.shape, annotations: { readOnlyHint: true } },
     async (input: z.infer<typeof jobSearchInput>) => call(async () => {
       const params = new URLSearchParams();
       for (const [key, value] of Object.entries({ ...input, limit: input.limit ?? 20 })) {
@@ -274,6 +276,8 @@ export function registerTools(server: McpServer, context: ToolContext) {
       }
       return { ...(await context.backend.request<Record<string, unknown>>(`/discover/jobs?${params}`)), untrusted: UNTRUSTED_JOB_TEXT };
     }));
+  server.registerTool("list_follow_ups_due", { description: "Applications waiting on the user, oldest first: jobs still in APPLIED where kind=DUE (no reply to lastEmail for 7+ days; follow up with prepare_application_email using replyToId=lastEmail.id and to=lastEmail.recipient; followUpNumber 1 is the first follow-up, at most 2 are suggested), kind=BOUNCED (lastEmail bounced: find another address, don't resend to it) or kind=NO_EMAIL (marked Applied with no email from CareerPilot for 7+ days). Jobs that got a reply are left out. Suggest; never send without the user's explicit approval.", inputSchema: {}, annotations: { readOnlyHint: true } },
+    async () => call(() => context.backend.request("/follow-ups")));
   server.registerTool("list_email_templates", { description: "List the user's email templates (use an id as templateId in prepare_application_email).", annotations: { readOnlyHint: true } },
     async () => call(() => context.backend.request("/email-templates")));
   server.registerTool("get_email_template", { description: "Retrieve an owned email template by id.", inputSchema: { templateId: id }, annotations: { readOnlyHint: true } },
