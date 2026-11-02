@@ -286,6 +286,20 @@ describe("apply flow", () => {
     });
   });
 
+  it("edits a job's details, keeping other notes when the HR email changes", async () => {
+    let patched: Record<string, unknown> = {};
+    const { tool } = await connect({
+      [`GET /jobs/${JOB}`]: () => ({ id: JOB, notes: "Referred by Asha\nHR email: old@acme.com" }),
+      [`PATCH /jobs/${JOB}`]: (body) => { patched = body as Record<string, unknown>; return { id: JOB, ...(body as object) }; },
+    });
+    const result = await tool("update_job_details", { jobId: JOB, title: "Java Developer", description: "Spring Boot role", hrEmail: "hr@acme.com" });
+    expect(result.error).toBe(false);
+    expect(patched).toEqual({ title: "Java Developer", description: "Spring Boot role", notes: "Referred by Asha\nHR email: hr@acme.com" });
+    expect((await tool("update_job_details", { jobId: JOB, title: "Two\nlines" })).error).toBe(true);
+    expect((await tool("update_job_details", { jobId: JOB, jobUrl: "javascript:alert(1)" })).error).toBe(true);
+    expect((await tool("update_job_details", { jobId: JOB })).error).toBe(true);
+  });
+
   it("searches jobs with only the filters given and marks the results untrusted", async () => {
     const paths: string[] = [];
     const { tool, calls } = await connect({});

@@ -67,6 +67,18 @@ export const jobSearchInput = z.object({
 type Approval = { principal: string; expiresAt: number; digest: string; content: ReturnType<typeof approvalContent> };
 const approvals = new Map<string, Approval>();
 
+const HR_EMAIL_LINE = /^HR email:.*$/m;
+
+/** Notes with the "HR email: …" line set (or removed when blank), the rest kept: the website's format. */
+export function notesWithHrEmail(notes: string | null | undefined, hrEmail: string): string | null {
+  const line = hrEmail.trim() ? `HR email: ${hrEmail.trim()}` : "";
+  const current = notes ?? "";
+  const next = HR_EMAIL_LINE.test(current)
+    ? current.replace(HR_EMAIL_LINE, line)
+    : [current, line].filter((part) => part.trim()).join("\n");
+  return next.replace(/\n{3,}/g, "\n\n").trim() || null;
+}
+
 /** The prepared email this token approves, for this user and job; throws when it's missing, expired or for another job. */
 function approvedEmail(token: string, jobId: string, principal: string): Approval {
   const approval = approvals.get(token);
@@ -205,8 +217,28 @@ export function registerTools(server: McpServer, context: ToolContext) {
     async ({ archived, status }: { archived?: boolean; status?: string }) => call(() => context.backend.request(`/jobs?archived=${archived === true ? "true" : "false"}${status ? `&status=${encodeURIComponent(status)}` : ""}`)));
   server.registerTool("get_job_details", { description: "Retrieve an owned job by id.", inputSchema: { jobId: id } },
     async ({ jobId }: { jobId: string }) => call(async () => ({ ...(await context.backend.request<Record<string, unknown>>(`/jobs/${jobId}`)), untrusted: UNTRUSTED_JOB_TEXT })));
-  server.registerTool("update_job_details", { description: "Correct an owned job's title, company or location (e.g. a scraped title that holds the whole post). Only the fields given change.", inputSchema: { jobId: id, title: z.string().trim().min(1).max(200).regex(/^[^\r\n]*$/, "must be a single line").nullish(), company: z.string().trim().min(1).max(200).nullish(), location: z.string().trim().max(200).nullish() } },
-    async ({ jobId, ...fields }: { jobId: string; title?: string | null; company?: string | null; location?: string | null }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(fields) })));
+  server.registerTool("update_job_details", { description: "Edit an owned job's details, after the user asked: title (e.g. a scraped title that holds the whole post), company, location, workMode, jobUrl, description, hrEmail (where applications go; empty string removes it) or notes. Only the fields given change; an empty string clears location, workMode, jobUrl, description, hrEmail or notes; status and sent emails are untouched (use update_job_status for the status). Show the user what changed.", inputSchema: {
+    jobId: id,
+    title: z.string().trim().min(1).max(200).regex(/^[^\r\n]*$/, "must be a single line").nullish(),
+    company: z.string().trim().min(1).max(200).nullish(),
+    location: z.string().trim().max(200).nullish(),
+    workMode: z.enum(["ONSITE", "HYBRID", "REMOTE", ""]).nullish(),
+    jobUrl: z.union([z.string().trim().max(2048).regex(/^https?:\/\/\S+$/, "must be a full http(s) link"), z.literal("")]).nullish(),
+    description: z.string().max(20_000).nullish(),
+    hrEmail: z.union([z.string().trim().email().max(254), z.literal("")]).nullish(),
+    notes: z.string().max(10_000).nullish(),
+  } },
+    async ({ jobId, hrEmail, ...fields }: { jobId: string; title?: string | null; company?: string | null; location?: string | null; workMode?: string | null; jobUrl?: string | null; description?: string | null; hrEmail?: string | null; notes?: string | null }) => call(async () => {
+      const changes: Record<string, unknown> = Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
+      if (hrEmail !== undefined && hrEmail !== null) {
+        // The HR email lives on its own line in the notes (as the website saves it); the rest of the notes is kept
+        const notes = typeof changes.notes === "string" ? changes.notes
+          : (await context.backend.request<{ notes: string | null }>(`/jobs/${jobId}`)).notes;
+        changes.notes = notesWithHrEmail(notes, hrEmail);
+      }
+      if (Object.keys(changes).length === 0) throw new Error("Nothing to change: pass at least one field.");
+      return context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(changes) });
+    }));
   server.registerTool("update_job_status", { description: "Update the status of an owned job.", inputSchema: { jobId: id, status: z.enum(JOB_STATUSES) } },
     async ({ jobId, status }: { jobId: string; status: string }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify({ status }) })));
   server.registerTool("prepare_application_email", { description: "Compose an application email from the user's template for review; sends nothing. To change the wording (a different subject, the user's own body or signature, edits they ask for), pass subject and/or body: they replace the template's, and {{placeholders}} in them (e.g. {{job_title}}, {{company_name}}, {{resume_url}}) are filled the same way. Every change needs a new prepare_application_email call, which returns a new approvalToken for the exact final text. Pass driveDocumentId (from save_tailored_resume): that Drive PDF is attached and its link replaces the saved resume link in the body. For a follow-up, pass replyToId (an email id from get_application_email_status for this job): it goes into that email's Gmail thread. Show the user the recipient, subject, body, attachment, resume changes and the email it follows up, and only call send_application_email after they explicitly say to send (or schedule_application_email, with the time they chose, if they want it sent later).", inputSchema: { jobId: id, to: z.string().email().max(254), templateId: z.string().uuid().nullish(), timeZone: z.string().max(64).nullish(), driveDocumentId: z.string().uuid().nullish(), replyToId: z.string().uuid().nullish(), subject: z.string().trim().max(255).refine((value) => !/[\r\n]/.test(value), "must be a single line").nullish(), body: z.string().max(20_000).nullish() }, annotations: { readOnlyHint: true } },
