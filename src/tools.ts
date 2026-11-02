@@ -65,7 +65,7 @@ const approvals = new Map<string, Approval>();
 const approvalDigest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const text = (value: unknown) => JSON.stringify(value, null, 2);
 type Composed = { templateId: string | null; templateName: string | null; subject: string; body: string; missingFields: { placeholder: string; label: string }[]; unknownPlaceholders: string[] };
-type GmailStatus = { configured: boolean; connected: boolean; canSend: boolean; googleEmail: string | null };
+type GmailStatus = { configured: boolean; connected: boolean; canSend: boolean; canSchedule?: boolean; googleEmail: string | null };
 type DriveStatus = { configured: boolean; connected: boolean; permissionGranted: boolean; folderName: string | null };
 type DriveDocument = { id: string; name: string; webViewLink: string | null };
 type SentEmail = { id: string; recipient: string; subject: string; sentAt: string; status: string };
@@ -196,7 +196,7 @@ export function registerTools(server: McpServer, context: ToolContext) {
     async ({ jobId, ...fields }: { jobId: string; title?: string | null; company?: string | null; location?: string | null }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(fields) })));
   server.registerTool("update_job_status", { description: "Update the status of an owned job.", inputSchema: { jobId: id, status: z.enum(JOB_STATUSES) } },
     async ({ jobId, status }: { jobId: string; status: string }) => call(() => context.backend.request(`/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify({ status }) })));
-  server.registerTool("prepare_application_email", { description: "Compose an application email from the user's template for review; sends nothing. Pass driveDocumentId (from save_tailored_resume): that Drive PDF is attached and its link replaces the saved resume link in the body. For a follow-up, pass replyToId (an email id from get_application_email_status for this job): it goes into that email's Gmail thread. Show the user the recipient, subject, body, attachment, resume changes and the email it follows up, and only call send_application_email after they explicitly say to send.", inputSchema: { jobId: id, to: z.string().email().max(254), templateId: z.string().uuid().nullish(), timeZone: z.string().max(64).nullish(), driveDocumentId: z.string().uuid().nullish(), replyToId: z.string().uuid().nullish() }, annotations: { readOnlyHint: true } },
+  server.registerTool("prepare_application_email", { description: "Compose an application email from the user's template for review; sends nothing. Pass driveDocumentId (from save_tailored_resume): that Drive PDF is attached and its link replaces the saved resume link in the body. For a follow-up, pass replyToId (an email id from get_application_email_status for this job): it goes into that email's Gmail thread. Show the user the recipient, subject, body, attachment, resume changes and the email it follows up, and only call send_application_email after they explicitly say to send (or schedule_application_email, with the time they chose, if they want it sent later).", inputSchema: { jobId: id, to: z.string().email().max(254), templateId: z.string().uuid().nullish(), timeZone: z.string().max(64).nullish(), driveDocumentId: z.string().uuid().nullish(), replyToId: z.string().uuid().nullish() }, annotations: { readOnlyHint: true } },
     async ({ jobId, to, templateId, timeZone, driveDocumentId, replyToId }: { jobId: string; to: string; templateId?: string | null; timeZone?: string | null; driveDocumentId?: string | null; replyToId?: string | null }) => call(async () => {
       const [composed, gmail, documents, fields, history] = await Promise.all([
         context.backend.request<Composed>(`/jobs/${jobId}/emails/compose`, { method: "POST", body: JSON.stringify({ templateId, timeZone }) }),
@@ -239,6 +239,28 @@ export function registerTools(server: McpServer, context: ToolContext) {
       // replyToId: the backend sends it in that email's Gmail thread
       return context.backend.request(`/jobs/${jobId}/emails`, { method: "POST", body: JSON.stringify({ ...input, confirmed: true }) });
     }));
+  server.registerTool("schedule_application_email", { description: "Schedule a prepared application email instead of sending it now: it is saved as a draft in the user's Gmail Drafts (Gmail's API can't use Gmail's own Scheduled folder) and CareerPilot sends that draft at sendAt, within a few minutes. Only after the user explicitly approved the exact email shown by prepare_application_email AND the send time. sendAt is ISO 8601 with the user's time zone offset (e.g. 2026-11-03T09:00:00+05:30), at least a minute ahead and within a year. Edits the user makes to the draft in Gmail are what gets sent. Change or cancel it with reschedule_scheduled_email / cancel_scheduled_email.", inputSchema: { jobId: id, approvalToken: z.string().uuid(), sendAt: z.string().datetime({ offset: true }), ...emailContent.shape }, annotations: { destructiveHint: true } },
+    async ({ jobId, approvalToken, sendAt, ...input }: { jobId: string; approvalToken: string; sendAt: string } & z.infer<typeof emailContent>) => call(async () => {
+      const approval = approvals.get(approvalToken);
+      const digest = approvalDigest(approvalContent({ jobId, ...input }));
+      if (!approval || approval.principal !== context.principal || approval.expiresAt < Date.now() || approval.digest !== digest) {
+        throw new Error("Approval is missing, expired, or does not match the exact message.");
+      }
+      const gmail = await context.backend.request<GmailStatus>("/gmail/status");
+      if (!gmail.canSchedule) {
+        throw new Error("Scheduling isn't allowed yet: the user must open the email dialog in CareerPilot, choose Schedule and press Allow scheduling (Google asks once for permission to create drafts). Nothing was scheduled.");
+      }
+      approvals.delete(approvalToken);
+      return context.backend.request(`/jobs/${jobId}/emails/schedule`, { method: "POST", body: JSON.stringify({ ...input, sendAt, confirmed: true }) });
+    }));
+  server.registerTool("list_scheduled_emails", { description: "The user's scheduled application emails: SCHEDULED (waiting as a Gmail draft), SENDING, FAILED (with the reason in error), then recently SENT or CANCELLED. Times are UTC ISO 8601; show them in the user's time zone.", inputSchema: {}, annotations: { readOnlyHint: true } },
+    async () => call(() => context.backend.request("/scheduled-emails")));
+  server.registerTool("reschedule_scheduled_email", { description: "Change when a SCHEDULED email is sent, after the user asked for the new time. sendAt is ISO 8601 with the user's time zone offset, at least a minute ahead.", inputSchema: { scheduledEmailId: id, sendAt: z.string().datetime({ offset: true }) } },
+    async ({ scheduledEmailId, sendAt }: { scheduledEmailId: string; sendAt: string }) => call(() => context.backend.request(`/scheduled-emails/${scheduledEmailId}`, { method: "PATCH", body: JSON.stringify({ sendAt }) })));
+  server.registerTool("send_scheduled_email_now", { description: "Send a SCHEDULED email right away instead of waiting, only after the user explicitly asks. It can't be recalled once sent.", inputSchema: { scheduledEmailId: id }, annotations: { destructiveHint: true } },
+    async ({ scheduledEmailId }: { scheduledEmailId: string }) => call(() => context.backend.request(`/scheduled-emails/${scheduledEmailId}/send-now`, { method: "POST" })));
+  server.registerTool("cancel_scheduled_email", { description: "Cancel a SCHEDULED (or remove a FAILED) email so it's never sent, and delete its draft from the user's Gmail. Only after the user asks.", inputSchema: { scheduledEmailId: id }, annotations: { destructiveHint: true } },
+    async ({ scheduledEmailId }: { scheduledEmailId: string }) => call(() => context.backend.request(`/scheduled-emails/${scheduledEmailId}`, { method: "DELETE" })));
   server.registerTool("import_job_from_link", { description: "Read a job posting from a link (LinkedIn post, job board, careers page) and save it to the user's jobs. Returns the saved job and the HR email found in the post. To apply: tailor_resume_for_job (from the user's own resume) → save_tailored_resume → prepare_application_email (to = hrEmail, driveDocumentId from save_tailored_resume) → show the user → send_application_email after they confirm.", inputSchema: { url: z.string().max(2048).regex(/^https?:\/\/\S+$/) } },
     async ({ url }: { url: string }) => call(async () => {
       const found = await context.backend.request<Record<string, string | boolean>>("/jobs/import-from-url", { method: "POST", body: JSON.stringify({ url }) });
@@ -255,14 +277,21 @@ export function registerTools(server: McpServer, context: ToolContext) {
       }) });
       return { job, hrEmail: found.hrEmail || null, readByAi: found.ai, untrusted: UNTRUSTED_JOB_TEXT, note: found.hrEmail ? undefined : "No HR email in the post: ask the user where to send the application." };
     }));
-  server.registerPrompt("apply_to_job_link", { description: "Apply to a job from a link: import it, tailor a resume, draft the email, and send after one confirmation.", argsSchema: { url: z.string() } },
+  server.registerPrompt("apply_to_job_link", { description: "Apply to a job from a link: import it, tailor a resume, draft the email, and send (or schedule) after one confirmation.", argsSchema: { url: z.string() } },
     ({ url }: { url: string }) => ({ messages: [{ role: "user" as const, content: { type: "text" as const, text: [
       `Apply to the job at ${url} using CareerPilot:`,
       "1. import_job_from_link with the url.",
       `2. list_my_resumes and pick the most relevant of my own resumes (not "${AI_RESUME_TITLE}"; ask if unsure); tailor_resume_for_job with the new jobId; write the tailoring following its rules; save_tailored_resume with the jobId.`,
       "3. prepare_application_email with to = hrEmail (ask me if none) and driveDocumentId from save_tailored_resume.",
       "4. Show me one summary: recipient, subject, body, attached resume, and the resume changes from save_tailored_resume. Stop if it is not ready.",
-      "5. Only after I reply 'send', call send_application_email with exactly the prepared values.",
+      "5. Only after I reply 'send', call send_application_email with exactly the prepared values. If I reply 'schedule' with a time (e.g. 'schedule tomorrow 9am'), confirm the exact date, time and my time zone back to me, then call schedule_application_email with exactly the prepared values and sendAt as ISO 8601 with my time zone offset.",
+    ].join("\n") } }] }));
+  server.registerPrompt("manage_scheduled_emails", { description: "See your scheduled application emails and change, send or cancel them.", argsSchema: {} },
+    () => ({ messages: [{ role: "user" as const, content: { type: "text" as const, text: [
+      "Show my scheduled CareerPilot emails:",
+      "1. list_scheduled_emails. Show each as: job and company, recipient, send time in my time zone, status, and the error for any FAILED one.",
+      "2. Ask what I'd like to do. Only after I say so: reschedule_scheduled_email (confirm the new date, time and time zone first), send_scheduled_email_now, or cancel_scheduled_email.",
+      "3. Remind me that waiting emails are drafts in my Gmail Drafts, and edits I make there are what gets sent.",
     ].join("\n") } }] }));
   server.registerTool("get_application_email_status", { description: "Tracking for the emails sent about an owned job: status (REPLIED, BOUNCED, OPENED, DELIVERED or SENT), when it was opened and replied to. DELIVERED means no bounce came back; opens are approximate (images can be blocked or prefetched) and openTracked=false means opens weren't tracked; checkedAt=null means bounces and replies can't be checked until the user allows reply tracking in CareerPilot.", inputSchema: { jobId: id }, annotations: { readOnlyHint: true } },
     async ({ jobId }: { jobId: string }) => call(() => context.backend.request(`/jobs/${jobId}/emails`)));

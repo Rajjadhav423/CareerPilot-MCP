@@ -207,6 +207,46 @@ describe("apply flow", () => {
     expect(sent).toMatchObject({ replyToId: SENT, confirmed: true });
   });
 
+  it("schedules only an approved email, then lists, reschedules and cancels it", async () => {
+    let scheduled: Record<string, unknown> = {};
+    const SCHEDULED = "66666666-6666-4666-8666-666666666666";
+    const { tool, calls } = await connect({
+      [`POST /jobs/${JOB}/emails/compose`]: () => composed,
+      "GET /gmail/status": () => ({ ...gmailReady, canSchedule: true }),
+      [`POST /jobs/${JOB}/emails/schedule`]: (body) => { scheduled = body as Record<string, unknown>; return { id: SCHEDULED, status: "SCHEDULED" }; },
+      "GET /scheduled-emails": () => [{ id: SCHEDULED, status: "SCHEDULED" }],
+      [`PATCH /scheduled-emails/${SCHEDULED}`]: (body) => ({ id: SCHEDULED, ...(body as object) }),
+      [`DELETE /scheduled-emails/${SCHEDULED}`]: () => ({ id: SCHEDULED, status: "CANCELLED" }),
+    });
+    const prepared = (await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com" })).value;
+    const { approvalToken, to, subject, body, templateId } = prepared;
+    const sendAt = "2026-11-03T09:00:00+05:30";
+    // A changed body isn't the approved email
+    expect((await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt, to, subject, body: "Changed", templateId })).error).toBe(true);
+    expect((await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt: "tomorrow 9am", to, subject, body, templateId })).error).toBe(true);
+    const result = await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt, to, subject, body, templateId });
+    expect(result.error).toBe(false);
+    expect(scheduled).toMatchObject({ to: "hr@acme.com", sendAt, confirmed: true });
+    // The approval is used up
+    expect((await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt, to, subject, body, templateId })).error).toBe(true);
+    expect((await tool("list_scheduled_emails", {})).value).toEqual([{ id: SCHEDULED, status: "SCHEDULED" }]);
+    expect((await tool("reschedule_scheduled_email", { scheduledEmailId: SCHEDULED, sendAt: "2026-11-04T09:00:00+05:30" })).value).toMatchObject({ sendAt: "2026-11-04T09:00:00+05:30" });
+    expect((await tool("cancel_scheduled_email", { scheduledEmailId: SCHEDULED })).value).toMatchObject({ status: "CANCELLED" });
+    expect(calls.filter((call) => call.includes("schedul"))).toHaveLength(4);
+  });
+
+  it("won't schedule until Gmail allows drafts", async () => {
+    const { tool, calls } = await connect({
+      [`POST /jobs/${JOB}/emails/compose`]: () => composed,
+      "GET /gmail/status": () => ({ ...gmailReady, canSchedule: false }),
+    });
+    const { approvalToken, to, subject, body, templateId } = (await tool("prepare_application_email", { jobId: JOB, to: "hr@acme.com" })).value;
+    const result = await tool("schedule_application_email", { jobId: JOB, approvalToken, sendAt: "2026-11-03T09:00:00+05:30", to, subject, body, templateId });
+    expect(result.error).toBe(true);
+    expect(result.value).toMatch(/Allow scheduling/);
+    expect(calls.some((call) => call.endsWith("/schedule"))).toBe(false);
+  });
+
   it("searches jobs with only the filters given and marks the results untrusted", async () => {
     const paths: string[] = [];
     const { tool, calls } = await connect({});
